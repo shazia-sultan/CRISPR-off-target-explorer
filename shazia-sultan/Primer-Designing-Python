@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+# Primer Designing – Python (pasted input OR file; FASTA tolerant, including '> SEQ' on one line)
+
+from collections import Counter
+import os, re, sys
+
+PRIMER_LEN = 21
+ALLOWED = set("acgt")
+
+# ---------------------------- core helpers ----------------------------
+
+def reverse_complement(seq: str) -> str:
+    trans = str.maketrans("acgt", "tgca")
+    return seq.translate(trans)[::-1]
+
+def clean_seq(s: str) -> str:
+    """Lowercase and keep only A/C/G/T."""
+    raw = s.lower()
+    return "".join(ch for ch in raw if ch in ALLOWED)
+
+def parse_fasta_text(text: str):
+    """
+    Parse text that may be:
+      - raw sequence
+      - standard FASTA (>header on its own line, sequence below)
+      - single-line 'FASTA' like '> ACGTACGT...' (tolerated here)
+    Returns list of (header, seq) with cleaned sequences.
+    """
+    lines = [ln.rstrip("\n\r") for ln in text.splitlines()]
+    if not lines:
+        return []
+
+    has_gt = any(ln.startswith(">") for ln in lines)
+    if not has_gt:
+        seq = clean_seq("".join(lines))
+        return [("sequence", seq)] if seq else []
+
+    records, header, chunks = [], None, []
+
+    def flush():
+        nonlocal records, header, chunks
+        if header is not None:
+            seq = clean_seq("".join(chunks))
+            if seq:
+                records.append((header or "sequence", seq))
+        header, chunks = None, []
+
+    for ln in lines:
+        if ln.startswith(">"):
+            # If remainder after '>' looks like bases, treat it as sequence-on-header-line
+            rem = ln[1:]
+            if re.fullmatch(r"\s*[ACGTacgt\s]+", rem or ""):
+                flush()
+                header = "sequence"
+                chunks = [rem]  # this remainder is actually sequence
+            else:
+                flush()
+                header = rem.strip() or "sequence"
+                chunks = []
+        else:
+            chunks.append(ln)
+    flush()
+    return records
+
+def _clean_path(s: str) -> str:
+    """Trim quotes; if user pasted a whole shell command, extract the quoted path."""
+    s = s.strip()
+    quotes = re.findall(r'"([^"]+)"|\'([^\']+)\'', s)
+    if quotes:
+        return [a or b for (a, b) in quotes][-1].strip()
+    return s.strip('"\'')
+
+def parse_file(path: str):
+    path = _clean_path(path)
+    if not os.path.isfile(path):
+        sys.exit(f"File not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        return parse_fasta_text(f.read())
+
+def count_bases(seq: str):
+    c = Counter(seq)
+    return c.get('a', 0), c.get('t', 0), c.get('g', 0), c.get('c', 0)
+
+def valid_primer(primer: str):
+    """
+    Rules:
+      - length = 21
+      - last base must be g/c (GC clamp)
+      - Tm = 4*(G+C) + 2*(A+T) in [56, 60]
+      - GC% in [40, 55]
+      - avoid 'atatat'/'tatata', 'gcgcgc'/'cgcgcg'
+      - avoid homopolymers of length 5
+      - last 5 bases contain <= 3 G/C
+    Returns (ok, tm, gc_perc, gc_last5)
+    """
+    if len(primer) != PRIMER_LEN:
+        return False, None, None, None
+    if primer[-1] not in ('g', 'c'):
+        return False, None, None, None
+
+    a, t, g, c = count_bases(primer)
+    tm = 4 * (g + c) + 2 * (a + t)
+    gc_perc = (g + c) / PRIMER_LEN * 100.0
+    if not (56 <= tm <= 60):
+        return False, tm, gc_perc, None
+    if not (40 <= gc_perc <= 55):
+        return False, tm, gc_perc, None
+
+    if any(b in primer for b in ("atatat", "tatata", "gcgcgc", "cgcgcg")):
+        return False, tm, gc_perc, None
+    if any(b in primer for b in ("aaaaa", "ttttt", "ggggg", "ccccc")):
+        return False, tm, gc_perc, None
+
+    gc_last5 = sum(1 for b in primer[-5:] if b in ('g', 'c'))
+    if gc_last5 > 3:
+        return False, tm, gc_perc, gc_last5
+
+    return True, tm, gc_perc, gc_last5
+
+def find_first_valid_primer(seq: str):
+    """Slide a 21-nt window and return the first valid primer dict or None."""
+    n = len(seq)
+    for i in range(0, n - PRIMER_LEN + 1):
+        p = seq[i:i + PRIMER_LEN]
+        ok, tm, gc_perc, gc_last5 = valid_primer(p)
+        if ok:
+            return {
+                "primer": p,
+                "pos1": i + 1,  # 1-based
+                "tm": tm,
+                "gc_perc": gc_perc,
+                "gc_last5": gc_last5
+            }
+    return None
+
+def analyze_one(name: str, seq: str):
+    print(f"\n=== {name} ===")
+    total_bases = len(seq)
+    print(f"Total bases: {total_bases}")
+    if total_bases < PRIMER_LEN:
+        print(f"Sequence shorter than {PRIMER_LEN} nt; skipping.")
+        return
+
+    # Forward primer
+    fwd = find_first_valid_primer(seq)
+    if fwd:
+        print(
+            f"\nforward primer:: {fwd['primer']}\n"
+            f" length of primer : {PRIMER_LEN}\n"
+            f" position: {fwd['pos1']}\n"
+            f" tm: {fwd['tm']}\n"
+            f" GC% : {fwd['gc_perc']:.2f}\n"
+            f" 'GC' amount in last five bases {fwd['gc_last5']}\n"
+            f" no poly mononucleotide & dinucleotides present\n"
+        )
+    else:
+        print("\nNo valid forward primer found with the specified constraints.\n")
+
+    # Reverse primer (search on reverse complement) and map to forward coordinates
+    rev = reverse_complement(seq)
+    rev_hit = find_first_valid_primer(rev)
+    if rev_hit:
+        i_rc = rev_hit['pos1']       # 1-based index in RC strand
+        N = len(seq)
+        f_start = N - (i_rc + PRIMER_LEN - 1) + 1
+        f_end   = N - i_rc + 1
+        print(
+            f"\nReverse primer:: {rev_hit['primer']}\n"
+            f" length of primer : {PRIMER_LEN}\n"
+            f" position in reverse-complement: {i_rc}\n"
+            f" forward-strand coords: {f_start}..{f_end} (reverse orientation)\n"
+            f" tm: {rev_hit['tm']}\n"
+            f" GC% : {rev_hit['gc_perc']:.2f}\n"
+            f" 'GC' amount in last five bases {rev_hit['gc_last5']}\n"
+            f" no poly mononucleotide & dinucleotides present\n"
+        )
+    else:
+        print("No valid reverse primer found with the specified constraints.\n")
+
+# ---------------------------- friendly I/O ----------------------------
+
+def looks_like_seq(s: str) -> bool:
+    """Detect if a single line looks like sequence/FASTA."""
+    s = s.strip()
+    if not s:
+        return False
+    if s.startswith(">"):
+        return True
+    s2 = re.sub(r"\s+", "", s).lower()
+    return len(s2) >= 10 and all(ch in "acgt" for ch in s2)
+
+def main():
+    print("Choose input mode:")
+    print("  1) Paste sequence or FASTA (end with a blank line)")
+    print("  2) Provide a file path (FASTA or plain text)")
+    first = input("> ").strip()
+
+    # Normal choices
+    if first == "1":
+        print("\nPaste your sequence or FASTA now. Press ENTER on a blank line to finish:")
+        buf = []
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                break
+            if line.strip() == "":
+                break
+            buf.append(line)
+        text = "\n".join(buf)
+        records = parse_fasta_text(text)
+
+    elif first == "2":
+        raw = input("Enter file path: ").strip()
+        records = parse_file(raw)
+
+    # Auto-detect if user pasted a sequence or FASTA at the first prompt
+    elif looks_like_seq(first):
+        buf = [first]
+        print("(Detected pasted sequence/FASTA. Continue pasting, blank line to finish.)")
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                break
+            if line.strip() == "":
+                break
+            buf.append(line)
+        text = "\n".join(buf)
+        records = parse_fasta_text(text)
+
+    # Auto-detect a file path pasted at the first prompt
+    else:
+        candidate = _clean_path(first)
+        if os.path.isfile(candidate):
+            records = parse_file(candidate)
+        else:
+            sys.exit("Invalid choice. Type 1, 2, paste a sequence/FASTA, or paste a valid file path.")
+
+    if not records:
+        sys.exit("No valid sequence found after cleaning. Please check your input.")
+
+    for name, seq in records:
+        analyze_one(name, seq)
+
+if __name__ == "__main__":
+    main()
